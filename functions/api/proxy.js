@@ -9,6 +9,7 @@ const ALLOWED_HOSTS = [
   'query2.finance.yahoo.com',
   'finnhub.io',
   'www.taifex.com.tw',
+  'openapi.taifex.com.tw',
 ];
 
 export async function onRequest(context) {

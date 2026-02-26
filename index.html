@@ -51,6 +51,7 @@
       <button class="main-tab active" data-tab="margin">股票融資融券</button>
       <button class="main-tab" data-tab="futures">期貨</button>
       <button class="main-tab" data-tab="options">選擇權</button>
+      <button class="main-tab" data-tab="guide">說明</button>
     </nav>
 
     <!-- Tab Contents -->
@@ -95,6 +96,10 @@
             <button class="toggle-btn active" data-value="long">做多 Buy</button>
             <button class="toggle-btn" data-value="short">做空 Sell</button>
           </div>
+          <div class="toggle-group" data-group="futures-product">
+            <button class="toggle-btn active" data-value="index">指數</button>
+            <button class="toggle-btn" data-value="stock">股票</button>
+          </div>
         </div>
         <div class="calc-layout">
           <div class="input-panel card">
@@ -117,6 +122,10 @@
             <button class="toggle-btn active" data-value="buyer">買方 Buyer</button>
             <button class="toggle-btn" data-value="seller">賣方 Seller</button>
           </div>
+          <div class="toggle-group" data-group="options-product">
+            <button class="toggle-btn active" data-value="index">指數</button>
+            <button class="toggle-btn" data-value="stock">個股</button>
+          </div>
         </div>
         <div class="calc-layout">
           <div class="input-panel card">
@@ -126,6 +135,11 @@
             <div id="options-results"></div>
           </div>
         </div>
+      </section>
+
+      <!-- GUIDE TAB -->
+      <section id="tab-guide" class="tab-content">
+        <div id="guide-content"></div>
       </section>
 
     </main>
