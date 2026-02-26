@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TradeGuard 交易風險計算器</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+TC:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Header -->
+    <header class="site-header">
+      <div class="logo">
+        <svg class="logo-icon" viewBox="0 0 28 28" fill="none">
+          <rect x="1" y="17" width="5" height="10" rx="1" fill="#00c853"/>
+          <rect x="8" y="12" width="5" height="15" rx="1" fill="#00b4d8"/>
+          <rect x="15" y="7" width="5" height="20" rx="1" fill="#ffd600"/>
+          <rect x="22" y="2" width="5" height="25" rx="1" fill="#ff1744"/>
+        </svg>
+        <h1>TradeGuard</h1>
+      </div>
+      <button class="settings-btn" id="btn-settings" title="設定">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+        </svg>
+      </button>
+    </header>
+
+    <!-- Settings Panel -->
+    <div class="settings-overlay" id="settings-overlay"></div>
+    <div class="settings-panel" id="settings-panel">
+      <div class="settings-header">
+        <h3>設定</h3>
+        <button class="settings-close" id="btn-settings-close">&times;</button>
+      </div>
+      <div class="settings-body" id="settings-body"></div>
+    </div>
+
+    <!-- Market Ticker Bar -->
+    <div class="ticker-bar">
+      <div class="ticker-label">指數行情</div>
+      <div class="ticker-inputs" id="ticker-inputs"></div>
+      <button class="ticker-fetch-btn" id="btn-fetch-indices" title="取得即時報價">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M1 4v6h6"/><path d="M23 20v-6h-6"/>
+          <path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/>
+        </svg>
+        <span>即時報價</span>
+      </button>
+    </div>
+
+    <!-- Main Tabs -->
+    <nav class="main-tabs">
+      <button class="main-tab active" data-tab="margin">股票融資融券</button>
+      <button class="main-tab" data-tab="futures">期貨</button>
+      <button class="main-tab" data-tab="options">選擇權</button>
+      <button class="main-tab" data-tab="chart">K線圖表</button>
+    </nav>
+
+    <!-- Tab Contents -->
+    <main class="main-content">
+
+      <!-- MARGIN TAB -->
+      <section id="tab-margin" class="tab-content active">
+        <div class="controls-bar">
+          <div class="toggle-group" data-group="margin-market">
+            <button class="toggle-btn active" data-value="tw">台灣</button>
+            <button class="toggle-btn" data-value="us">美國</button>
+          </div>
+          <div class="toggle-group direction-toggle" data-group="margin-direction">
+            <button class="toggle-btn active" data-value="long">做多 融資/Long</button>
+            <button class="toggle-btn" data-value="short">做空 融券/Short</button>
+          </div>
+          <div class="toggle-group" data-group="margin-product">
+            <button class="toggle-btn active" data-value="stock">個股</button>
+            <button class="toggle-btn" data-value="etf">指數ETF</button>
+            <button class="toggle-btn" data-value="letf">槓桿ETF</button>
+          </div>
+        </div>
+        <div class="calc-layout">
+          <div class="input-panel card">
+            <div id="margin-inputs"></div>
+          </div>
+          <div class="result-panel">
+            <div id="margin-results"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- FUTURES TAB -->
+      <section id="tab-futures" class="tab-content">
+        <div class="controls-bar">
+          <div class="toggle-group" data-group="futures-market">
+            <button class="toggle-btn active" data-value="tw">台灣</button>
+            <button class="toggle-btn" data-value="us">美國</button>
+          </div>
+          <div class="toggle-group direction-toggle" data-group="futures-direction">
+            <button class="toggle-btn active" data-value="long">做多 Buy</button>
+            <button class="toggle-btn" data-value="short">做空 Sell</button>
+          </div>
+        </div>
+        <div class="calc-layout">
+          <div class="input-panel card">
+            <div id="futures-inputs"></div>
+          </div>
+          <div class="result-panel">
+            <div id="futures-results"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- OPTIONS TAB -->
+      <section id="tab-options" class="tab-content">
+        <div class="controls-bar">
+          <div class="toggle-group" data-group="options-market">
+            <button class="toggle-btn active" data-value="tw">台灣</button>
+            <button class="toggle-btn" data-value="us">美國</button>
+          </div>
+          <div class="toggle-group direction-toggle" data-group="options-side">
+            <button class="toggle-btn active" data-value="buyer">買方 Buyer</button>
+            <button class="toggle-btn" data-value="seller">賣方 Seller</button>
+          </div>
+        </div>
+        <div class="calc-layout">
+          <div class="input-panel card">
+            <div id="options-inputs"></div>
+          </div>
+          <div class="result-panel">
+            <div id="options-results"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- CHART TAB -->
+      <section id="tab-chart" class="tab-content">
+        <div class="chart-bar">
+          <div class="chart-quick">
+            <button class="chart-qbtn active" data-sym="TWSE:TAIEX">加權指數</button>
+            <button class="chart-qbtn" data-sym="SP:SPX">S&P 500</button>
+            <button class="chart-qbtn" data-sym="NASDAQ:NDX">Nasdaq</button>
+            <button class="chart-qbtn" data-sym="DJ:DJI">道瓊</button>
+            <button class="chart-qbtn" data-sym="NASDAQ:SOX">費半</button>
+            <button class="chart-qbtn" data-sym="TVC:NI225">日經225</button>
+            <button class="chart-qbtn" data-sym="KRX:KOSPI">KOSPI</button>
+            <button class="chart-qbtn" data-sym="SSE:000001">上證</button>
+            <button class="chart-qbtn" data-sym="TVC:HSI">恆生</button>
+          </div>
+          <div class="chart-search-row">
+            <input type="text" id="chart-sym-input" placeholder="代號 (如 2330、AAPL)">
+            <button class="mini-fetch-btn" id="chart-go-btn">查看</button>
+          </div>
+          <a class="chart-tv-link" id="chart-tv-link" href="https://www.tradingview.com/chart/?symbol=TWSE%3ATAIEX" target="_blank" rel="noopener">
+            <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+            <span>在 TradingView 開啟</span>
+          </a>
+        </div>
+        <div class="chart-wrap" id="tv-chart-wrap">
+          <div id="tv-chart"></div>
+        </div>
+        <p class="chart-note">圖表由 TradingView 提供 &mdash; 點選「在 TradingView 開啟」可享訂閱方案完整功能 (更多指標、即時數據、無廣告)</p>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>TradeGuard &mdash; 僅供參考，實際規則以各券商/期貨商公告為準</p>
+    </footer>
+  </div>
+  <script src="js/app.js"></script>
+</body>
+</html>
