@@ -32,6 +32,7 @@ const INDEX_DEFS = {
 // ================================================================
 const PriceService = {
   PROXIES: [
+    url => `/api/proxy?url=${encodeURIComponent(url)}`,
     url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
     url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
   ],
@@ -229,11 +230,15 @@ const PriceService = {
     let data;
     // 1) Try direct POST (works if CORS allows)
     try { const r = await this._fetchTimeout(url, 4000, postOpts); if (r.ok) data = await r.json(); } catch {}
-    // 2) Try POST through corsproxy.io (supports POST pass-through)
+    // 2) Try POST through own proxy (Cloudflare Pages Function)
+    if (!data) {
+      try { const r = await this._fetchTimeout(`/api/proxy?url=${encodeURIComponent(url)}`, 8000, postOpts); if (r.ok) data = await r.json(); } catch {}
+    }
+    // 3) Try POST through corsproxy.io
     if (!data) {
       try { const r = await this._fetchTimeout(`https://corsproxy.io/?url=${encodeURIComponent(url)}`, 10000, postOpts); if (r.ok) data = await r.json(); } catch {}
     }
-    // 3) Fallback: GET with query params through any proxy
+    // 4) Fallback: GET with query params through any proxy
     if (!data) {
       const getUrl = url + '?' + new URLSearchParams(payload).toString();
       const r = await this._proxyFetch(getUrl, 10000);
