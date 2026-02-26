@@ -16,6 +16,7 @@ const PLACEHOLDER = '<div class="results-placeholder"><p>輸入參數即可即�
 // ── Central index definitions ──
 const INDEX_DEFS = {
   taiex:    { name: '加權指數',  placeholder: '22000', market: 'tw', region: '台灣', chart: 'TWSE:TAIEX' },
+  txf:      { name: '台指期',    placeholder: '22000', market: 'tw', region: '台灣', chart: 'TWSE:TAIEX' },
   sp500:    { name: 'S&P 500',   placeholder: '5800',  market: 'us', region: '美國', chart: 'SP:SPX' },
   nasdaq:   { name: 'Nasdaq',    placeholder: '18000', market: 'us', region: '美國', chart: 'NASDAQ:NDX' },
   dow:      { name: '道瓊',      placeholder: '42000', market: 'us', region: '美國', chart: 'DJ:DJI' },
@@ -35,10 +36,10 @@ const PriceService = {
     url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
   ],
 
-  async _fetchTimeout(url, ms = 8000) {
+  async _fetchTimeout(url, ms = 8000, opts = {}) {
     const ctrl = new AbortController();
     const tid = setTimeout(() => ctrl.abort(), ms);
-    try { const r = await fetch(url, { signal: ctrl.signal }); clearTimeout(tid); return r; }
+    try { const r = await fetch(url, { ...opts, signal: ctrl.signal }); clearTimeout(tid); return r; }
     catch (e) { clearTimeout(tid); throw e; }
   },
 
@@ -142,6 +143,9 @@ const PriceService = {
   },
 
   async fetchIndex(key) {
+    // 台指期走專屬 TAIFEX MIS API
+    if (key === 'txf') return await this.fetchTxfQuote();
+
     const market = INDEX_DEFS[key]?.market || 'us';
     const provider = (market === 'tw' || market === 'us') ? this._getProvider(market) : this.yahoo;
     const symbol = provider.INDEX_MAP?.[key];
@@ -214,10 +218,88 @@ const PriceService = {
       if (im > 0) margins[code] = { im, mm };
     }
     return { margins, date: dataDate };
+  },
+
+  // ── TAIFEX 台指期即時報價 ──
+  async fetchTxfQuote() {
+    const url = 'https://mis.taifex.com.tw/futures/api/getQuoteList';
+    const payload = { MarketType: '0', SymbolType: 'F', KindID: '1', CID: 'TXF', WithGreeks: 'N', ShowLimitPrices: 'N' };
+    const postOpts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) };
+
+    let data;
+    // 1) Try direct POST (works if CORS allows)
+    try { const r = await this._fetchTimeout(url, 4000, postOpts); if (r.ok) data = await r.json(); } catch {}
+    // 2) Try POST through corsproxy.io (supports POST pass-through)
+    if (!data) {
+      try { const r = await this._fetchTimeout(`https://corsproxy.io/?url=${encodeURIComponent(url)}`, 10000, postOpts); if (r.ok) data = await r.json(); } catch {}
+    }
+    // 3) Fallback: GET with query params through any proxy
+    if (!data) {
+      const getUrl = url + '?' + new URLSearchParams(payload).toString();
+      const r = await this._proxyFetch(getUrl, 10000);
+      data = await r.json();
+    }
+
+    const list = data?.RtData?.QuoteList;
+    if (!Array.isArray(list) || list.length === 0) throw new Error('無資料');
+    // list[0] 是臺指現貨 (TXF-S)，跳過；取第一筆近月期貨合約 (SymbolID 含 -F)
+    const item = list.find(i => i.SymbolID && i.SymbolID.endsWith('-F')) || list[1] || list[0];
+    const price = parseFloat(item.CLastPrice) || 0;
+    const prev = parseFloat(item.CRefPrice) || price;
+    if (!price) throw new Error('尚無成交');
+    // 使用 TAIFEX 提供的官方漲跌值
+    const change = parseFloat(item.CDiff) || (price - prev);
+    const changePct = parseFloat(item.CDiffRate) || (prev ? (change / prev * 100) : 0);
+    const contractName = item.DispCName || '台指期';
+    return { price, prevClose: prev, change, changePct, currency: 'TWD', name: contractName };
   }
 };
 
 let _taifexMarginDate = '';
+
+// ── Price Cache (localStorage 持久化，重新整理不重抓) ──
+const _quoteCache = {
+  _KEY: 'tg-quote-cache',
+  _VER: 2, // 升版清除舊資料
+  _mem: null,
+  _load() {
+    if (this._mem) return this._mem;
+    try { this._mem = JSON.parse(localStorage.getItem(this._KEY)) || {}; } catch { this._mem = {}; }
+    // 版本不符 → 清快取
+    if (this._mem._ver !== this._VER) { this._mem = { _ver: this._VER }; this._save(); }
+    if (!this._mem.indices) this._mem.indices = {};
+    if (!this._mem.stocks) this._mem.stocks = {};
+    return this._mem;
+  },
+  _save() { try { localStorage.setItem(this._KEY, JSON.stringify(this._mem)); } catch {} },
+  // TTL: 依設定的 refreshInterval；若為 0（關閉自動更新）則 30 分鐘
+  _ttl() { return (CFG.refreshInterval > 0 ? CFG.refreshInterval * 1000 : 1800000); },
+  getIndex(key) {
+    const c = this._load().indices[key];
+    return (c && Date.now() - c.time < this._ttl()) ? c.data : null;
+  },
+  setIndex(key, data) { this._load().indices[key] = { data, time: Date.now() }; this._save(); },
+  getStock(market, code) {
+    const k = `${market}:${code.trim().toUpperCase()}`;
+    const c = this._load().stocks[k];
+    return (c && Date.now() - c.time < this._ttl()) ? c.data : null;
+  },
+  setStock(market, code, data) { const d = this._load(); d.stocks[`${market}:${code.trim().toUpperCase()}`] = { data, time: Date.now() }; this._save(); },
+  // 取得所有 index 快取的最後更新時間
+  lastIndexTime() {
+    const d = this._load().indices;
+    let latest = 0;
+    for (const k of Object.keys(d)) { if (d[k]?.time > latest) latest = d[k].time; }
+    return latest;
+  },
+  // 取得所有已快取的 index 資料（不檢查 TTL，用於頁面載入恢復顯示）
+  getAllIndices() {
+    const d = this._load().indices;
+    const out = {};
+    for (const [k, v] of Object.entries(d)) { if (v?.data) out[k] = v.data; }
+    return out;
+  },
+};
 
 // ── TAIFEX margin fetch handler ──
 window.fetchTaifexMarginBtn = async function() {
@@ -253,6 +335,18 @@ window.fetchTaifexMarginBtn = async function() {
     setTimeout(() => { if (dateEl) dateEl.textContent = _taifexMarginDate ? `期交所 ${_taifexMarginDate}` : ''; }, 3000);
   }
 };
+
+// ── Quote time stamp: show fetch time next to a field ──
+function stampTime(fieldId, source) {
+  const el = document.getElementById(fieldId);
+  if (!el) return;
+  const fg = el.closest('.fg');
+  if (!fg) return;
+  let span = fg.querySelector('.quote-time');
+  if (!span) { span = document.createElement('span'); span.className = 'quote-time'; fg.appendChild(span); }
+  const t = new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  span.textContent = `${source || '報價'} ${t}`;
+}
 
 // ── Debounce ──
 function debounce(fn, ms) {
@@ -327,21 +421,17 @@ function wrapNumberInputs(container) {
 const DEFAULT_SETTINGS = {
   autoFetch: true,
   refreshInterval: 0,
-  indices: { taiex: true, sp500: true, nasdaq: true, dow: true, sox: true, nikkei: true, kospi: true, shanghai: true, hsi: true },
+  indices: { taiex: true, txf: true, sp500: true, nasdaq: true, dow: true, sox: true, nikkei: true, kospi: true, shanghai: true, hsi: true },
   defaultMarket: 'tw',
   twSource: 'twse',        // 'yahoo' | 'twse' | 'tpex'
   usSource: 'yahoo',       // 'yahoo' | 'finnhub'
   finnhubKey: '',
-  chartInterval: 'D',      // '1' | '5' | '15' | '60' | 'D' | 'W' | 'M'
-  chartStyle: '1',         // '1' candle | '0' bar | '2' line | '3' area | '9' heikin ashi
   fontScale: 'm',          // 'xs' | 's' | 'm' | 'l' | 'xl'
 };
 function loadSettings() {
   try {
     const raw = JSON.parse(localStorage.getItem('tg-settings')) || {};
     return { ...DEFAULT_SETTINGS, ...raw, indices: { ...DEFAULT_SETTINGS.indices, ...(raw.indices || {}) },
-      chartInterval: raw.chartInterval || DEFAULT_SETTINGS.chartInterval,
-      chartStyle: raw.chartStyle || DEFAULT_SETTINGS.chartStyle,
       fontScale: raw.fontScale || DEFAULT_SETTINGS.fontScale };
   } catch { return { ...DEFAULT_SETTINGS }; }
 }
@@ -351,7 +441,7 @@ let _refreshTimer = null;
 
 // ── State ──
 const S = {
-  margin: { market: 'tw', direction: 'long', product: 'stock' },
+  margin: { market: 'tw', direction: 'cash', product: 'stock' },
   futures: { market: 'tw', direction: 'long' },
   options: { market: 'tw', side: 'buyer' }
 };
@@ -422,6 +512,21 @@ function alertBox(level, msg) {
 function mc(label, value, sub, hl) {
   return `<div class="mc${hl ? ' ' + hl : ''}"><div class="ml">${label}</div><div class="mv">${value}</div>${sub ? `<div class="ms">${sub}</div>` : ''}</div>`;
 }
+function mgLabel(text) { return `<div class="mg-label">${text}</div>`; }
+
+/** Cost breakdown table
+ *  items: [{ name, detail?, amt }]  — detail is optional calculation note
+ *  total: formatted total string
+ *  netPL: { label, value (formatted), positive (bool) } — optional net P&L row
+ */
+function costTable(items, total, netPL) {
+  let rows = items.filter(i => i).map(i =>
+    `<div class="cost-row"><div class="cost-left"><span class="cost-name">${i.name}</span>${i.detail ? `<span class="cost-detail">${i.detail}</span>` : ''}</div><span class="cost-amt">${i.amt}</span></div>`
+  ).join('');
+  rows += `<div class="cost-total"><span class="cost-name">合計</span><span class="cost-amt">${total}</span></div>`;
+  if (netPL) rows += `<div class="cost-net ${netPL.positive ? 'profit' : 'loss'}"><span class="cost-name">${netPL.label}</span><span class="cost-amt">${netPL.value}</span></div>`;
+  return `<div class="cost-box"><div class="cost-title"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8l-6-6zm-1 9h-2v2H9v-2H7v-2h2V7h2v2h2v2zm3 6H8v-2h8v2zm0-4h-1v-2h1v2zM13 9V3.5L18.5 9H13z"/></svg>交易成本明細</div>${rows}</div>`;
+}
 
 // ================================================================
 //  BUILD TICKER BAR (dynamic from INDEX_DEFS)
@@ -431,12 +536,51 @@ function buildTickerBar() {
   if (!container) return;
   container.innerHTML = Object.entries(INDEX_DEFS).map(([key, def]) => {
     const show = CFG.indices[key] !== false;
-    return `<div class="ticker-item" data-idx="${key}" style="${show ? '' : 'display:none'}">
-      <span class="ticker-name">${def.name}</span>
-      <input type="number" id="idx-${key}" placeholder="${def.placeholder}" step="any">
-      <span class="ticker-chg" id="chg-${key}"></span>
-    </div>`;
+    const tvUrl = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(def.chart)}`;
+    return `<a class="ticker-chip" data-idx="${key}" style="${show ? '' : 'display:none'}" href="${tvUrl}" target="_blank" rel="noopener" title="在 TradingView 開啟 ${def.name}">
+      <span class="tc-name">${def.name}</span>
+      <span class="tc-price stale" id="disp-${key}">—</span>
+      <span class="tc-chg" id="chg-${key}"></span>
+      ${key === 'txf' ? '<span class="ticker-basis" id="ticker-basis"></span>' : ''}
+      <input type="hidden" id="idx-${key}">
+    </a>`;
   }).join('');
+}
+
+// 計算台指期 vs 加權指數的正逆價差
+function _updateBasis(results) {
+  const el = $('#ticker-basis');
+  if (!el) return;
+  const taiex = results?.taiex || _quoteCache.getIndex('taiex');
+  const txf = results?.txf || _quoteCache.getIndex('txf');
+  if (!taiex || taiex.error || !txf || txf.error) { el.textContent = ''; return; }
+  const basis = txf.price - taiex.price;
+  const label = basis >= 0 ? '正價差' : '逆價差';
+  el.textContent = `${label} ${basis >= 0 ? '+' : ''}${basis.toFixed(0)}`;
+  el.className = `ticker-basis ${basis >= 0 ? 'up' : 'down'}`;
+}
+
+// 從 localStorage 快取恢復 ticker 顯示（頁面載入時）
+function _restoreIndicesFromCache() {
+  const cached = _quoteCache.getAllIndices();
+  if (Object.keys(cached).length === 0) return false;
+  let ok = 0;
+  for (const [key, q] of Object.entries(cached)) {
+    if (!q || q.error) continue;
+    ok++;
+    _renderTickerChip(key, q);
+  }
+  if (ok > 0) {
+    _updateBasis(cached);
+    const timeEl = $('#ticker-time');
+    const lastT = _quoteCache.lastIndexTime();
+    if (timeEl && lastT) timeEl.textContent = new Date(lastT).toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' });
+    if ($('#f-entry')) fillFromTicker('f-entry');
+    if ($('#f-current')) fillFromTicker('f-current');
+    if ($('#o-ul')) fillOptFromTicker();
+    autoFillMarginPrice();
+  }
+  return ok > 0;
 }
 
 // ================================================================
@@ -451,7 +595,6 @@ function init() {
     b.classList.add('active');
     $$('.tab-content').forEach(x => x.classList.remove('active'));
     $(`#tab-${b.dataset.tab}`).classList.add('active');
-    if (b.dataset.tab === 'chart') initChart();
   }));
 
   // Toggle groups
@@ -520,6 +663,11 @@ function init() {
   $('#tab-futures').addEventListener('change', liveFutures);
   $('#tab-options').addEventListener('input', liveOptions);
   $('#tab-options').addEventListener('change', liveOptions);
+
+  // ── 初始計算（讓預設值立刻顯示結果）──
+  calcMargin();
+  calcFutures();
+  calcOptions();
 
   // ── 根據設定決定是否自動取報價 ──
   applySettings();
@@ -614,31 +762,6 @@ function renderSettings() {
       </div>
     </div>
     <div class="stg-section">
-      <h4>K線圖表</h4>
-      <div class="stg-row">
-        <label>預設週期<span class="stg-hint">圖表預設時間週期</span></label>
-        <select class="stg-select" id="stg-chart-interval">
-          <option value="1" ${CFG.chartInterval === '1' ? 'selected' : ''}>1 分鐘</option>
-          <option value="5" ${CFG.chartInterval === '5' ? 'selected' : ''}>5 分鐘</option>
-          <option value="15" ${CFG.chartInterval === '15' ? 'selected' : ''}>15 分鐘</option>
-          <option value="60" ${CFG.chartInterval === '60' ? 'selected' : ''}>1 小時</option>
-          <option value="D" ${CFG.chartInterval === 'D' ? 'selected' : ''}>日線</option>
-          <option value="W" ${CFG.chartInterval === 'W' ? 'selected' : ''}>週線</option>
-          <option value="M" ${CFG.chartInterval === 'M' ? 'selected' : ''}>月線</option>
-        </select>
-      </div>
-      <div class="stg-row">
-        <label>圖表樣式<span class="stg-hint">K線顯示方式</span></label>
-        <select class="stg-select" id="stg-chart-style">
-          <option value="1" ${CFG.chartStyle === '1' ? 'selected' : ''}>K線 (陰陽燭)</option>
-          <option value="0" ${CFG.chartStyle === '0' ? 'selected' : ''}>美國線 (Bar)</option>
-          <option value="2" ${CFG.chartStyle === '2' ? 'selected' : ''}>折線</option>
-          <option value="3" ${CFG.chartStyle === '3' ? 'selected' : ''}>面積圖</option>
-          <option value="9" ${CFG.chartStyle === '9' ? 'selected' : ''}>平均K線 (Heikin Ashi)</option>
-        </select>
-      </div>
-    </div>
-    <div class="stg-section">
       <h4>字體大小</h4>
       <div class="stg-row">
         <label>全站字體縮放<span class="stg-hint">調整所有文字大小</span></label>
@@ -672,8 +795,6 @@ function renderSettings() {
     CFG.autoFetch = $('#stg-auto-fetch')?.checked ?? true;
     CFG.refreshInterval = parseInt($('#stg-refresh')?.value || '0', 10);
     CFG.defaultMarket = $('#stg-default-market')?.value || 'tw';
-    CFG.chartInterval = $('#stg-chart-interval')?.value || 'D';
-    CFG.chartStyle = $('#stg-chart-style')?.value || '1';
     CFG.fontScale = $('#stg-font-scale')?.value || 'm';
     $$('[data-idx]', body).forEach(cb => { CFG.indices[cb.dataset.idx] = cb.checked; });
     saveSettings(CFG);
@@ -689,19 +810,34 @@ function applySettings() {
 
   // Show/hide ticker items based on settings
   Object.entries(CFG.indices).forEach(([k, show]) => {
-    const item = $(`.ticker-item[data-idx="${k}"]`);
+    const item = $(`.ticker-chip[data-idx="${k}"]`);
     if (item) item.style.display = show ? '' : 'none';
   });
 
-  // Auto-fetch on load (only trigger once per page load)
-  if (CFG.autoFetch && !applySettings._fetched) {
+  // First load: restore from cache, only fetch if cache is stale or empty
+  if (!applySettings._fetched) {
     applySettings._fetched = true;
-    handleFetchIndices();
-    // Also auto-fetch TAIFEX margins
-    fetchTaifexMarginBtn();
+
+    // 1) Restore indices from localStorage cache
+    const hasCache = _restoreIndicesFromCache();
+    const lastT = _quoteCache.lastIndexTime();
+    const ttl = _quoteCache._ttl();
+    const stale = !lastT || (Date.now() - lastT >= ttl);
+
+    // 2) Stock data: try cache first, else fetch
+    handleFetchStock();
+
+    // 3) Only fetch indices if no cache or cache expired
+    if (CFG.autoFetch && (!hasCache || stale)) {
+      handleFetchIndices();
+      fetchTaifexMarginBtn();
+    } else if (hasCache && !stale) {
+      // Cache is fresh — also auto-fetch TAIFEX margins from cache/API
+      fetchTaifexMarginBtn();
+    }
   }
 
-  // Refresh timer
+  // Refresh timer (based on settings interval)
   if (_refreshTimer) { clearInterval(_refreshTimer); _refreshTimer = null; }
   if (CFG.refreshInterval > 0) {
     _refreshTimer = setInterval(handleFetchIndices, CFG.refreshInterval * 1000);
@@ -710,133 +846,44 @@ function applySettings() {
 applySettings._fetched = false;
 
 // ================================================================
-//  K-LINE CHART (TradingView)
-// ================================================================
-let _chartInited = false;
-let _chartSymbol = 'TWSE:TAIEX';
-
-function initChart() {
-  if (_chartInited) return;
-  _chartInited = true;
-
-  // Quick buttons
-  $$('.chart-qbtn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      $$('.chart-qbtn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      loadChart(btn.dataset.sym);
-    });
-  });
-
-  // Search
-  const input = $('#chart-sym-input');
-  const goBtn = $('#chart-go-btn');
-  const go = () => {
-    let sym = input?.value?.trim();
-    if (!sym) return;
-    if (/^\d{4,6}[A-Za-z]?$/.test(sym)) sym = `TWSE:${sym}`;
-    else if (/^[A-Za-z]+$/.test(sym)) sym = sym.toUpperCase();
-    $$('.chart-qbtn').forEach(b => b.classList.remove('active'));
-    loadChart(sym);
-  };
-  if (goBtn) goBtn.addEventListener('click', go);
-  if (input) input.addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
-
-  loadChart(_chartSymbol);
-}
-
-function loadChart(symbol) {
-  _chartSymbol = symbol;
-  const container = document.getElementById('tv-chart');
-  if (!container) return;
-  container.innerHTML = '';
-
-  // Direct iframe embed — bypasses JS widget restrictions (works from file:// too)
-  const config = {
-    autosize: true,
-    symbol: symbol,
-    interval: CFG.chartInterval || 'D',
-    timezone: 'Asia/Taipei',
-    theme: 'dark',
-    style: CFG.chartStyle || '1',
-    locale: 'zh_TW',
-    allow_symbol_change: true,
-    calendar: false,
-    hide_volume: false,
-    support_host: 'https://www.tradingview.com'
-  };
-
-  const iframe = document.createElement('iframe');
-  iframe.src = 'https://s.tradingview.com/embed-widget/advanced-chart/?locale=zh_TW#' + encodeURIComponent(JSON.stringify(config));
-  iframe.style.cssText = 'width:100%;height:100%;border:none;display:block';
-  iframe.setAttribute('frameborder', '0');
-  iframe.setAttribute('allowtransparency', 'true');
-  iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts allow-popups allow-forms');
-  container.appendChild(iframe);
-
-  // Update "open in TradingView" link
-  const tvLink = document.getElementById('chart-tv-link');
-  if (tvLink) tvLink.href = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(symbol)}`;
-}
-
-// Allow other tabs to open chart for a symbol
-window.openChart = function(symbol) {
-  _chartSymbol = symbol;
-  // Switch to chart tab
-  $$('.main-tab').forEach(x => x.classList.remove('active'));
-  const chartTabBtn = $(`.main-tab[data-tab="chart"]`);
-  if (chartTabBtn) chartTabBtn.classList.add('active');
-  $$('.tab-content').forEach(x => x.classList.remove('active'));
-  $('#tab-chart')?.classList.add('active');
-  $$('.chart-qbtn').forEach(b => b.classList.remove('active'));
-  initChart();
-  loadChart(symbol);
-};
-
-// ================================================================
 //  FETCH INDEX PRICES
 // ================================================================
 async function handleFetchIndices() {
   const btn = $('#btn-fetch-indices');
   if (!btn || btn.classList.contains('loading')) return;
   btn.classList.add('loading');
-  btn.querySelector('span').textContent = '載入中…';
 
   try {
     const results = await PriceService.fetchAllIndices();
     let ok = 0, fail = 0;
     for (const [key, q] of Object.entries(results)) {
-      const input = $(`#idx-${key}`);
-      const chgEl = $(`#chg-${key}`);
-      const item = input?.closest('.ticker-item');
-      if (q.error) { fail++; if (chgEl) chgEl.textContent = ''; continue; }
+      if (q.error) { fail++; continue; }
       ok++;
-      if (input) {
-        input.value = q.price.toFixed(2);
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-      }
-      if (chgEl) {
-        chgEl.textContent = PriceService.fmtChg(q);
-        chgEl.className = `ticker-chg ${q.change >= 0 ? 'up' : 'down'}`;
-      }
-      if (item) item.classList.add('has-data');
+      _quoteCache.setIndex(key, q);
+      _renderTickerChip(key, q);
     }
-    btn.querySelector('span').textContent = ok > 0 ? `已更新 ${ok}筆` : '更新失敗';
-    // Auto-fill form fields from updated ticker values
     if (ok > 0) {
-      if ($('#f-entry') && !gV('f-entry')) fillFromTicker('f-entry');
-      if ($('#f-current') && !gV('f-current')) fillFromTicker('f-current');
-      if ($('#o-ul') && !gV('o-ul')) fillOptFromTicker();
+      if ($('#f-entry')) fillFromTicker('f-entry');
+      if ($('#f-current')) fillFromTicker('f-current');
+      if ($('#o-ul')) fillOptFromTicker();
+      autoFillMarginPrice();
     }
-    // Show timestamp
-    let timeEl = $('.ticker-time');
-    if (!timeEl) { timeEl = document.createElement('span'); timeEl.className = 'ticker-time'; btn.parentElement.appendChild(timeEl); }
-    timeEl.textContent = new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' });
-  } catch (e) {
-    btn.querySelector('span').textContent = '更新失敗';
-  }
+    _updateBasis(results);
+    // Update time display
+    const timeEl = $('#ticker-time');
+    if (timeEl) timeEl.textContent = new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' });
+  } catch (e) {}
   btn.classList.remove('loading');
-  setTimeout(() => { btn.querySelector('span').textContent = '即時報價'; }, 3000);
+}
+
+// 更新單一 ticker chip 的顯示
+function _renderTickerChip(key, q) {
+  const input = $(`#idx-${key}`);
+  const dispEl = $(`#disp-${key}`);
+  const chgEl = $(`#chg-${key}`);
+  if (input) { input.value = q.price.toFixed(2); input.dispatchEvent(new Event('input', { bubbles: true })); }
+  if (dispEl) { dispEl.textContent = fmt(q.price, q.price % 1 !== 0 ? 2 : 0); dispEl.classList.remove('stale'); }
+  if (chgEl) { chgEl.textContent = PriceService.fmtChg(q); chgEl.className = `tc-chg ${q.change >= 0 ? 'up' : 'down'}`; }
 }
 
 // ================================================================
@@ -853,30 +900,59 @@ async function handleFetchStock() {
   if (infoEl) infoEl.innerHTML = '<span class="tm">查詢中…</span>';
 
   try {
-    const q = await PriceService.fetchStockQuote(symbolInput.value, market);
-    const chgCls = q.change >= 0 ? 'price-up' : 'price-down';
-    const chgStr = PriceService.fmtChg(q);
     const code = symbolInput.value.trim();
-    const tvSym = market === 'tw' && /^\d{4,6}[A-Za-z]?$/.test(code) ? `TWSE:${code}` : code.toUpperCase();
-    if (infoEl) infoEl.innerHTML = `<strong>${q.name || code}</strong> <span class="${chgCls}">${q.price.toFixed(2)} ${chgStr}</span> <a href="#" onclick="openChart('${tvSym}');return false;" style="color:var(--accent);font-size:.66rem;margin-left:4px">K線圖</a>`;
-
-    // Fill price into the correct field
-    const long = S.margin.direction === 'long';
-    const priceField = $(long ? '#m-buy-price' : '#m-sell-price');
-    if (priceField) {
-      priceField.value = q.price.toFixed(2);
-      priceField.dispatchEvent(new Event('input', { bubbles: true }));
+    // Check cache first
+    let q = _quoteCache.getStock(market, code);
+    if (!q) {
+      q = await PriceService.fetchStockQuote(code, market);
+      _quoteCache.setStock(market, code, q);
     }
-    // Also fill "目前價格"
-    const curField = $('#m-current-price');
-    if (curField && !curField.value) {
-      curField.value = q.price.toFixed(2);
-      curField.dispatchEvent(new Event('input', { bubbles: true }));
-    }
+    _displayStockInfo(q, code, market, infoEl);
+    _fillStockPrice(q, true);
   } catch (e) {
     if (infoEl) infoEl.innerHTML = `<span class="tr">${e.message}</span>`;
   }
   if (fetchBtn) { fetchBtn.disabled = false; fetchBtn.textContent = '查詢'; }
+}
+
+// ── Stock display & fill helpers ──
+function _displayStockInfo(q, code, market, infoEl) {
+  if (!infoEl) return;
+  const chgCls = q.change >= 0 ? 'price-up' : 'price-down';
+  const chgStr = PriceService.fmtChg(q);
+  const tvSym = market === 'tw' && /^\d{4,6}[A-Za-z]?$/.test(code) ? `TWSE:${code}` : code.toUpperCase();
+  const provName = market === 'tw' ? PriceService.PROVIDER_INFO[CFG.twSource]?.name : PriceService.PROVIDER_INFO[CFG.usSource]?.name;
+  const timeStr = new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const tvUrl = `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(tvSym)}`;
+  infoEl.innerHTML = `<span class="si-row"><strong>${q.name || code}</strong> <span class="${chgCls}">${q.price.toFixed(2)} ${chgStr}</span></span><span class="si-row"><span class="tm" style="font-size:.6rem">${provName} ${timeStr}</span> <a href="${tvUrl}" target="_blank" rel="noopener" style="color:var(--accent);font-size:.66rem;margin-left:4px">TradingView</a></span>`;
+}
+
+function _fillStockPrice(q, force) {
+  const isCashOrLong = S.margin.direction !== 'short';
+  const priceField = $(isCashOrLong ? '#m-buy-price' : '#m-sell-price');
+  if (priceField) {
+    priceField.value = q.price.toFixed(2);
+    priceField.dataset.fetched = '1';
+    priceField.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  const curField = $('#m-current-price');
+  if (curField && (!curField.value || force)) {
+    curField.value = q.price.toFixed(2);
+    curField.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+}
+
+// Restore stock info from cache after form rebuild (tab/mode switch)
+function _restoreStockFromCache() {
+  const symEl = $('#m-symbol');
+  if (!symEl || !symEl.value.trim()) return;
+  const code = symEl.value.trim();
+  const market = S.margin.market;
+  const q = _quoteCache.getStock(market, code);
+  if (!q) return;
+  const infoEl = $('#m-stock-info');
+  _displayStockInfo(q, code, market, infoEl);
+  _fillStockPrice(q);
 }
 
 // ================================================================
@@ -884,7 +960,7 @@ async function handleFetchStock() {
 // ================================================================
 function renderMarginForm() {
   const { market, direction, product } = S.margin;
-  const tw = market === 'tw', long = direction === 'long';
+  const tw = market === 'tw', long = direction === 'long', cash = direction === 'cash';
   const cur = tw ? 'NT$' : 'USD';
   const su = tw ? '張 (1張=1000股)' : '股';
 
@@ -902,28 +978,64 @@ function renderMarginForm() {
     `;
   }
 
-  const priceLabel = long ? '買進價格' : '賣出價格';
-  const priceId = long ? 'm-buy-price' : 'm-sell-price';
-  const marginId = long ? 'm-margin-rate' : 'm-short-margin-rate';
-  const marginOpts = long
-    ? (tw ? '<option value="0.6">60%</option><option value="0.5">50%</option><option value="0.4">40%</option>'
-         : '<option value="0.5">50% Reg T</option><option value="0.7">70%</option><option value="0.6">60%</option>')
-    : (tw ? '<option value="0.9">90%</option><option value="1.0">100%</option><option value="1.2">120%</option>'
-         : '<option value="0.5">50% Reg T</option><option value="0.6">60%</option>');
-  const defCall = long ? (tw ? 130 : 25) : (tw ? 130 : 30);
-  const defForced = long ? (tw ? 120 : 20) : (tw ? 120 : 25);
-
   const symbolHint = tw ? '例: 2330、0050' : '例: AAPL、MSFT';
-  const h = `
+
+  // ── 共用區塊：股票代號 + 價格 + 數量 ──
+  let h = `
     <div class="fg"><label>股票代號 <span class="hint">${symbolHint}</span></label>
       <div class="stock-search-row"><input type="text" id="m-symbol" placeholder="${tw ? '代號 (如 2330)' : 'Symbol (AAPL)'}"><button type="button" class="mini-fetch-btn" id="m-fetch-stock">查詢</button></div>
       <div class="stock-info" id="m-stock-info"></div>
     </div>
     ${extra}
     <div class="fr">
-      <div class="fg"><label>${priceLabel} <span class="hint">(${cur})</span></label><input type="number" id="${priceId}" placeholder="${tw ? '100' : '150'}" step="any"></div>
-      <div class="fg"><label>目前價格 <span class="hint">(留空=同進場)</span></label><input type="number" id="m-current-price" placeholder="即時價格" step="any"></div>
+      <div class="fg"><label>買進價格 <span class="hint">(${cur})</span></label><input type="number" id="m-buy-price" placeholder="${tw ? '市價' : 'Market'}" step="any"></div>
+      <div class="fg"><label>${cash ? '賣出價格' : '目前價格'} <span class="hint">(留空=同買進)</span></label><input type="number" id="m-current-price" placeholder="即時價格" step="any"></div>
+    </div>`;
+
+  if (cash) {
+    // ── 現股模式：只需數量 + 費用 ──
+    h += `
+    <div class="fg"><label>數量 <span class="hint">${su}</span></label><input type="number" id="m-qty" value="1" min="1" step="1"></div>
+    ${tw ? `<div class="fr">
+      <div class="fg"><label>手續費折扣</label><select id="m-fee-disc">
+        <option value="1">全額 0.1425%</option><option value="0.6">6折 0.0855%</option>
+        <option value="0.5" selected>5折 0.07125%</option><option value="0.38">3.8折</option>
+        <option value="0.28">2.8折 0.0399%</option><option value="0">免手續費</option>
+      </select></div>
+      <div class="fg"><label>證交稅(賣出)</label><select id="m-tax-rate">
+        <option value="0.003"${product === 'stock' ? ' selected' : ''}>0.3% 股票</option>
+        <option value="0.001"${product !== 'stock' ? ' selected' : ''}>0.1% ETF</option>
+        <option value="0.0015">0.15% 當沖減半</option>
+      </select></div>
+    </div>` : `<div class="fg"><label>Commission <span class="hint">(per trade)</span></label><input type="number" id="m-comm" value="0" step="any"></div>`}`;
+  } else {
+    // ── 融資/融券模式 ──
+    const priceLabel = long ? '買進價格' : '賣出價格';
+    const priceId = long ? 'm-buy-price' : 'm-sell-price';
+    const marginId = long ? 'm-margin-rate' : 'm-short-margin-rate';
+    const marginOpts = long
+      ? (tw ? '<option value="0.6">60%</option><option value="0.5">50%</option><option value="0.4">40%</option>'
+           : '<option value="0.5">50% Reg T</option><option value="0.7">70%</option><option value="0.6">60%</option>')
+      : (tw ? '<option value="0.9">90%</option><option value="1.0">100%</option><option value="1.2">120%</option>'
+           : '<option value="0.5">50% Reg T</option><option value="0.6">60%</option>');
+    const defCall = long ? (tw ? 130 : 25) : (tw ? 130 : 30);
+    const defForced = long ? (tw ? 120 : 20) : (tw ? 120 : 25);
+
+    // Replace buy price row with correct label for short
+    if (!long) {
+      h = `
+    <div class="fg"><label>股票代號 <span class="hint">${symbolHint}</span></label>
+      <div class="stock-search-row"><input type="text" id="m-symbol" placeholder="${tw ? '代號 (如 2330)' : 'Symbol (AAPL)'}"><button type="button" class="mini-fetch-btn" id="m-fetch-stock">查詢</button></div>
+      <div class="stock-info" id="m-stock-info"></div>
     </div>
+    ${extra}
+    <div class="fr">
+      <div class="fg"><label>${priceLabel} <span class="hint">(${cur})</span></label><input type="number" id="${priceId}" placeholder="${tw ? '市價' : 'Market'}" step="any"></div>
+      <div class="fg"><label>目前價格 <span class="hint">(留空=同進場)</span></label><input type="number" id="m-current-price" placeholder="即時價格" step="any"></div>
+    </div>`;
+    }
+
+    h += `
     <div class="fr">
       <div class="fg"><label>數量 <span class="hint">${su}</span></label><input type="number" id="m-qty" value="1" min="1" step="1"></div>
       <div class="fg"><label>${long ? (tw ? '融資成數' : 'Margin') : (tw ? '券保證金成數' : 'Short Margin')}</label><select id="${marginId}">${marginOpts}</select></div>
@@ -951,17 +1063,23 @@ function renderMarginForm() {
       <div class="fg"><label>Commission <span class="hint">(per trade)</span></label><input type="number" id="m-comm" value="0" step="any"></div>
       <div class="fg"><label>Holding Days</label><input type="number" id="m-hold-days" value="30" min="0" step="1"></div>
     </div>
-    <div class="fg"><label>Margin Interest Rate</label><div class="isuf"><input type="number" id="m-int-rate" value="${long ? '8' : '3'}" step="any"><span class="suf">%/yr</span></div></div>`}
-  `;
+    <div class="fg"><label>Margin Interest Rate</label><div class="isuf"><input type="number" id="m-int-rate" value="${long ? '8' : '3'}" step="any"><span class="suf">%/yr</span></div></div>`}`;
+  }
 
   $('#margin-inputs').innerHTML = h;
   $('#margin-results').innerHTML = PLACEHOLDER;
 
-  if (product === 'letf') {
+  // ETF / 槓桿 ETF 選擇時自動帶入代號並查詢
+  if (product === 'etf' || product === 'letf') {
     const sel = $('#m-etf-select');
     if (sel) sel.addEventListener('change', () => {
       const opt = sel.selectedOptions[0];
-      if (opt && opt.dataset.lev) $('#m-etf-lev').value = opt.dataset.lev;
+      const code = opt?.value;
+      if (product === 'letf' && opt?.dataset.lev) $('#m-etf-lev').value = opt.dataset.lev;
+      if (code) {
+        const symEl = $('#m-symbol');
+        if (symEl) { symEl.value = code; handleFetchStock(); }
+      }
     });
   }
 
@@ -971,7 +1089,37 @@ function renderMarginForm() {
   const symbolInput = $('#m-symbol');
   if (symbolInput) symbolInput.addEventListener('keydown', e => { if (e.key === 'Enter') handleFetchStock(); });
 
+  // Pre-fill default stock code
+  const defStock = tw ? '2330' : 'NVDA';
+  const symEl = $('#m-symbol');
+  if (symEl && !symEl.value) symEl.value = defStock;
+
   wrapNumberInputs($('#margin-inputs'));
+
+  // Restore cached stock data (so mode switch doesn't lose info)
+  _restoreStockFromCache();
+
+  calcMargin();
+}
+
+// Auto-fill margin price from default stock (called after ticker fetch)
+async function autoFillMarginPrice() {
+  const symEl = $('#m-symbol');
+  const priceId = S.margin.direction !== 'short' ? '#m-buy-price' : '#m-sell-price';
+  const priceEl = $(priceId);
+  if (!symEl || !symEl.value.trim() || !priceEl) return;
+  if (priceEl.dataset.fetched) return;
+  try {
+    const code = symEl.value.trim();
+    const mk = S.margin.market;
+    let q = _quoteCache.getStock(mk, code);
+    if (!q) {
+      q = await PriceService.fetchStockQuote(code, mk);
+      _quoteCache.setStock(mk, code, q);
+    }
+    _fillStockPrice(q);
+    _displayStockInfo(q, code, mk, $('#m-stock-info'));
+  } catch {}
 }
 
 // ================================================================
@@ -979,14 +1127,112 @@ function renderMarginForm() {
 // ================================================================
 function calcMargin() {
   const { market, direction, product } = S.margin;
-  const tw = market === 'tw', long = direction === 'long';
+  const tw = market === 'tw', long = direction === 'long', cash = direction === 'cash';
   const cur = tw ? 'NT$' : 'USD';
   const spu = tw ? 1000 : 1;
   const qty = gV('m-qty'), ts = qty * spu;
-  const cr = gV('m-call-rate') / 100, fr = gV('m-forced-rate') / 100;
   const etfLev = product === 'letf' ? (gV('m-etf-lev') || 1) : 1;
 
-  // Fee inputs
+  // ── CASH MODE (現股) ──
+  if (cash) {
+    const bp = gV('m-buy-price');
+    let cp = gV('m-current-price'); if (!cp) cp = bp;
+    if (!bp || !qty) { $('#margin-results').innerHTML = PLACEHOLDER; return; }
+    const tc = bp * ts, cv = cp * ts, upl = (cp - bp) * ts;
+    let buyFee, sellFee, sellTax, totalFees;
+    if (tw) {
+      const disc = parseFloat($('#m-fee-disc')?.value || '0.5');
+      const feeRate = 0.001425 * disc;
+      const taxRate = parseFloat($('#m-tax-rate')?.value || '0.003');
+      buyFee = Math.max(20, tc * feeRate); sellFee = Math.max(20, cv * feeRate); sellTax = cv * taxRate;
+    } else {
+      const comm = gV('m-comm') || 0;
+      buyFee = comm; sellFee = comm; sellTax = cv * 0.0000278;
+    }
+    totalFees = buyFee + sellFee + sellTax;
+    const netPL = upl - totalFees;
+    const roi = tc > 0 ? (netPL / tc * 100) : 0;
+    const plH = upl >= 0 ? 'h-green' : 'h-red', plS = upl >= 0 ? '+' : '';
+    const effectiveLev = Math.abs(etfLev);
+
+    const overview = `
+      ${alertBox('safe', '現股交易，無融資融券風險')}
+      <div class="mg">
+        ${mgLabel('部位資訊')}
+        ${mc('投入金額', fM(tc, cur), `${fM(bp, cur, 2)} × ${fmt(ts)}股`)}
+        ${mc('目前市值', fM(cv, cur), `${fM(cp, cur, 2)} × ${fmt(ts)}股`)}
+        ${product !== 'stock' ? mc('ETF槓桿', effectiveLev.toFixed(1) + 'x', `指數±1% → ETF±${effectiveLev.toFixed(1)}%`, 'h-accent') : ''}
+        ${mgLabel('損益')}
+        ${mc('未實現損益(税前)', plS + fM(upl, cur), `每股 ${plS}${fM(cp - bp, cur, 2)}`, plH)}
+        ${mc('投資報酬率', (netPL >= 0 ? '+' : '') + roi.toFixed(2) + '%', `淨損益 ${(netPL >= 0 ? '+' : '')}${fM(netPL, cur)}`, netPL >= 0 ? 'h-green' : 'h-red')}
+      </div>
+      ${totalFees > 0 ? costTable(
+        tw ? [
+          { name: '買進手續費', detail: `${fM(tc,cur)} × 0.1425% × ${parseFloat($('#m-fee-disc')?.value||'0.5')*10}折`, amt: fM(buyFee, cur) },
+          { name: '賣出手續費', detail: `${fM(cv,cur)} × 0.1425% × ${parseFloat($('#m-fee-disc')?.value||'0.5')*10}折`, amt: fM(sellFee, cur) },
+          { name: '證交稅(賣出)', detail: `${fM(cv,cur)} × ${(parseFloat($('#m-tax-rate')?.value||'0.003')*100).toFixed(2)}%`, amt: fM(sellTax, cur) },
+        ] : [
+          { name: 'Commission (Buy)', amt: fM(buyFee, cur) },
+          { name: 'Commission (Sell)', amt: fM(sellFee, cur) },
+          { name: 'SEC Fee (Sell)', detail: `${fM(cv,cur)} × 0.00278%`, amt: fM(sellTax, cur) },
+        ],
+        fM(totalFees, cur),
+        { label: '淨損益(税後)', value: (netPL >= 0 ? '+' : '') + fM(netPL, cur) + ` (報酬率 ${roi.toFixed(2)}%)`, positive: netPL >= 0 }
+      ) : ''}`;
+
+    const steps = [30, 25, 20, 15, 10, 5, 0, -5, -10, -15, -20, -25, -30, -35, -40, -45, -50];
+    let sRows = '';
+    for (const p of steps) {
+      const pr = bp * (1 + p / 100), diff = pr - bp, v = pr * ts, u = (pr - bp) * ts;
+      let sf;
+      if (tw) { const d2 = parseFloat($('#m-fee-disc')?.value||'0.5'), r2 = 0.001425*d2, t2 = parseFloat($('#m-tax-rate')?.value||'0.003'); sf = Math.max(20,tc*r2)+Math.max(20,v*r2)+v*t2; }
+      else { sf = (gV('m-comm')||0)*2+v*0.0000278; }
+      const net = u - sf, r = tc > 0 ? (net / tc * 100) : 0;
+      const rc2 = p === 0 ? 'rc' : '';
+      const diffStr = (diff >= 0 ? '+' : '') + fM(diff, cur, 2);
+      sRows += `<tr class="${rc2}"><td>${p > 0 ? '+' : ''}${p}%<br><span class="tm">${diffStr}</span></td><td>${fM(pr, cur, 2)}</td><td class="${u >= 0 ? 'tg' : 'tr'}">${u >= 0 ? '+' : ''}${fM(u, cur)}</td><td class="${net >= 0 ? 'tg' : 'tr'}">${net >= 0 ? '+' : ''}${fM(net, cur)}</td><td class="${r >= 0 ? 'tg' : 'tr'}">${r >= 0 ? '+' : ''}${r.toFixed(1)}%</td></tr>`;
+    }
+    const stress = `<div class="st-wrap"><table class="st"><thead><tr><th>漲跌</th><th>股價</th><th>損益</th><th>淨損益</th><th>報酬率</th></tr></thead><tbody>${sRows}</tbody></table></div>`;
+
+    const formula = tw ? `<div class="fc">
+      <div class="fb"><h4>1. 投入金額</h4>
+        <span class="fl"><span class="v">投入金額</span> <span class="o">=</span> 買進價格(<span class="n">${fM(bp,cur,2)}</span>) <span class="o">×</span> 股數(<span class="n">${fmt(ts)}</span>) <span class="o">=</span> <span class="r">${fM(tc,cur)}</span></span>
+      </div>
+      <div class="fb"><h4>2. 未實現損益</h4>
+        <span class="fl"><span class="v">損益</span> <span class="o">=</span> (目前價格(<span class="n">${fM(cp,cur,2)}</span>) <span class="o">−</span> 買進價格(<span class="n">${fM(bp,cur,2)}</span>)) <span class="o">×</span> 股數(<span class="n">${fmt(ts)}</span>) <span class="o">=</span> <span class="r">${plS}${fM(upl,cur)}</span></span>
+      </div>
+      <div class="fb"><h4>3. 交易成本</h4>
+        <span class="fl"><span class="v">買進手續費</span> <span class="o">=</span> max(20, ${fM(tc,cur)} × 0.1425% × ${parseFloat($('#m-fee-disc')?.value||'0.5')*10}折) <span class="o">=</span> <span class="r">${fM(buyFee,cur)}</span></span>
+        <span class="fl"><span class="v">賣出手續費</span> <span class="o">=</span> max(20, ${fM(cv,cur)} × 0.1425% × ${parseFloat($('#m-fee-disc')?.value||'0.5')*10}折) <span class="o">=</span> <span class="r">${fM(sellFee,cur)}</span></span>
+        <span class="fl"><span class="v">證交稅</span> <span class="o">=</span> ${fM(cv,cur)} × ${(parseFloat($('#m-tax-rate')?.value||'0.003')*100).toFixed(2)}% <span class="o">=</span> <span class="r">${fM(sellTax,cur)}</span></span>
+      </div>
+      <div class="fb"><h4>4. 淨損益 & 報酬率</h4>
+        <span class="fl"><span class="v">淨損益</span> <span class="o">=</span> 損益(<span class="n">${plS}${fM(upl,cur)}</span>) <span class="o">−</span> 成本(<span class="n">${fM(totalFees,cur)}</span>) <span class="o">=</span> <span class="r">${(netPL>=0?'+':'')}${fM(netPL,cur)}</span></span>
+        <span class="fl"><span class="v">報酬率</span> <span class="o">=</span> 淨損益 <span class="o">÷</span> 投入金額(<span class="n">${fM(tc,cur)}</span>) <span class="o">=</span> <span class="r">${roi.toFixed(2)}%</span></span>
+      </div>
+    </div>` : `<div class="fc">
+      <div class="fb"><h4>1. Total Cost</h4>
+        <span class="fl"><span class="v">Cost</span> <span class="o">=</span> Price(<span class="n">${fM(bp,cur,2)}</span>) <span class="o">×</span> Shares(<span class="n">${fmt(ts)}</span>) <span class="o">=</span> <span class="r">${fM(tc,cur)}</span></span>
+      </div>
+      <div class="fb"><h4>2. P&L</h4>
+        <span class="fl"><span class="v">P&L</span> <span class="o">=</span> (Current(<span class="n">${fM(cp,cur,2)}</span>) <span class="o">−</span> Buy(<span class="n">${fM(bp,cur,2)}</span>)) <span class="o">×</span> Shares(<span class="n">${fmt(ts)}</span>) <span class="o">=</span> <span class="r">${plS}${fM(upl,cur)}</span></span>
+      </div>
+      <div class="fb"><h4>3. Fees</h4>
+        <span class="fl"><span class="v">Commission</span> <span class="o">=</span> <span class="r">${fM(buyFee+sellFee,cur)}</span></span>
+        <span class="fl"><span class="v">SEC Fee</span> <span class="o">=</span> ${fM(cv,cur)} × 0.00278% <span class="o">=</span> <span class="r">${fM(sellTax,cur)}</span></span>
+      </div>
+      <div class="fb"><h4>4. Net P&L & ROI</h4>
+        <span class="fl"><span class="v">Net</span> <span class="o">=</span> P&L(<span class="n">${plS}${fM(upl,cur)}</span>) <span class="o">−</span> Fees(<span class="n">${fM(totalFees,cur)}</span>) <span class="o">=</span> <span class="r">${(netPL>=0?'+':'')}${fM(netPL,cur)}</span></span>
+        <span class="fl"><span class="v">ROI</span> <span class="o">=</span> Net <span class="o">÷</span> Cost(<span class="n">${fM(tc,cur)}</span>) <span class="o">=</span> <span class="r">${roi.toFixed(2)}%</span></span>
+      </div>
+    </div>`;
+
+    $('#margin-results').innerHTML = subTabs('mr', ['風險概覽', '壓力測試', '計算公式'], [overview, stress, formula]);
+    return;
+  }
+
+  // ── MARGIN (Long / Short) ──
+  const cr = gV('m-call-rate') / 100, fr = gV('m-forced-rate') / 100;
   const holdDays = gV('m-hold-days') || 0;
   const intRate = (gV('m-int-rate') || 0) / 100;
 
@@ -1016,38 +1262,50 @@ function calcMargin() {
     }
     totalFees = buyFee + sellFee + sellTax + interest;
     const netPL = upl - totalFees;
-    const lev = tc / te, effectiveLev = lev * Math.abs(etfLev);
+    const lev = te > 0 ? tc / te : 0, effectiveLev = lev * Math.abs(etfLev);
     let maint, callP, forcedP;
-    if (tw) { maint = cv / tl; callP = lps * cr; forcedP = lps * fr; }
-    else { maint = ce / cv; callP = lps / (1 - cr); forcedP = lps / (1 - fr); }
+    if (tw) { maint = tl > 0 ? cv / tl : 0; callP = lps * cr; forcedP = lps * fr; }
+    else { maint = cv > 0 ? ce / cv : 0; callP = (1 - cr) > 0 ? lps / (1 - cr) : 0; forcedP = (1 - fr) > 0 ? lps / (1 - fr) : 0; }
 
     const rl = tw ? riskLvl(maint * 100, 166, 140, cr * 100) : riskLvl(maint * 100, 40, 30, cr * 100);
     const mp = maint * 100, fillPct = tw ? Math.min(100, (mp - 100) / 100 * 100) : Math.min(100, mp);
-    const dC = bp - callP, dCP = dC / bp * 100, dF = bp - forcedP, dFP = dF / bp * 100;
-    const dCur = cp - callP, dCurP = dCur / cp * 100;
+    const dC = bp - callP, dCP = bp > 0 ? dC / bp * 100 : 0, dF = bp - forcedP, dFP = bp > 0 ? dF / bp * 100 : 0;
+    const dCur = cp - callP, dCurP = cp > 0 ? dCur / cp * 100 : 0;
     const statusMap = { safe: '安全', caution: '注意', danger: '追繳', critical: '斷頭' };
     const alertMsg = { safe: '維持率充足，風險可控。', caution: '接近追繳邊緣！', danger: tw ? '已觸發追繳！T+2 日內需補繳。' : 'Margin call!', critical: tw ? '已達斷頭標準！' : 'Forced liquidation!' };
-    const plH = upl >= 0 ? 'h-green' : 'h-red', plS = upl >= 0 ? '+' : '', eqRet = ((ce - te) / te * 100).toFixed(1);
+    const plH = upl >= 0 ? 'h-green' : 'h-red', plS = upl >= 0 ? '+' : '', eqRet = te > 0 ? ((ce - te) / te * 100).toFixed(1) : '0.0';
 
     const overview = `
       ${alertBox(rl === 'safe' ? 'safe' : rl === 'caution' ? 'warning' : 'danger', alertMsg[rl])}
       ${riskBar(tw ? '擔保維持率' : 'Margin Ratio', fP(mp), statusMap[rl], rl, fillPct)}
       <div class="mg">
+        ${mgLabel('部位資訊')}
         ${mc(tw ? '融資金額' : 'Loan', fM(tl, cur), `每股 ${fM(lps, cur, 2)}`)}
         ${mc(tw ? '自備款' : 'Equity', fM(te, cur), `每股 ${fM(eps, cur, 2)}`)}
         ${mc('槓桿倍數', effectiveLev.toFixed(2) + 'x', product === 'letf' ? `融資${lev.toFixed(1)}x × ETF${etfLev}x` : `±1% → 權益±${lev.toFixed(1)}%`, 'h-accent')}
+        ${mc('目前市值', fM(cv, cur), `成本 ${fM(tc, cur)}`)}
+        ${mgLabel('損益')}
         ${mc('未實現損益(税前)', plS + fM(upl, cur), `權益 ${fM(ce, cur)} (${eqRet}%)`, plH)}
-        ${totalFees > 0 ? mc('交易成本合計', fM(totalFees, cur), [
-          tw ? `手續費 ${fM(buyFee + sellFee, cur)}` : `Comm ${fM(buyFee + sellFee, cur)}`,
-          `${tw ? '證交稅' : 'SEC Fee'} ${fM(sellTax, cur)}`,
-          interest > 0 ? `${tw ? '融資利息' : 'Interest'}(${holdDays}天) ${fM(interest, cur)}` : ''
-        ].filter(Boolean).join(' / '), 'h-yellow') : ''}
-        ${totalFees > 0 ? mc('淨損益(税後)', (netPL >= 0 ? '+' : '') + fM(netPL, cur), `報酬率 ${(netPL / te * 100).toFixed(1)}%`, netPL >= 0 ? 'h-green' : 'h-red') : ''}
+        ${mgLabel('風險警示')}
         ${mc('追繳價格', fM(callP, cur, 2), `從買價跌 ${fM(dC, cur, 2)} (${fP(dCP)})`, rl !== 'safe' ? 'h-yellow' : '')}
         ${mc('斷頭價格', fM(forcedP, cur, 2), `從買價跌 ${fM(dF, cur, 2)} (${fP(dFP)})`, rl === 'critical' ? 'h-red' : '')}
         ${mc('距追繳可跌(從目前)', dCur > 0 ? fM(dCur, cur, 2) : '已追繳!', dCur > 0 ? fP(dCurP) : '')}
-        ${mc('目前市值', fM(cv, cur), `成本 ${fM(tc, cur)}`)}
-      </div>`;
+      </div>
+      ${totalFees > 0 ? costTable(
+        tw ? [
+          { name: '買進手續費', detail: `${fM(tc,cur)} × 0.1425% × ${parseFloat($('#m-fee-disc')?.value||'0.5')*10}折`, amt: fM(buyFee, cur) },
+          { name: '賣出手續費', detail: `${fM(cv,cur)} × 0.1425% × ${parseFloat($('#m-fee-disc')?.value||'0.5')*10}折`, amt: fM(sellFee, cur) },
+          { name: '證交稅(賣出)', detail: `${fM(cv,cur)} × ${(parseFloat($('#m-tax-rate')?.value||'0.003')*100).toFixed(2)}%`, amt: fM(sellTax, cur) },
+          interest > 0 ? { name: '融資利息', detail: `${fM(tl,cur)} × ${(intRate*100).toFixed(2)}% × ${holdDays}天`, amt: fM(interest, cur) } : null,
+        ] : [
+          { name: 'Commission (Buy)', amt: fM(buyFee, cur) },
+          { name: 'Commission (Sell)', amt: fM(sellFee, cur) },
+          { name: 'SEC Fee (Sell)', detail: `${fM(cv,cur)} × 0.00278%`, amt: fM(sellTax, cur) },
+          interest > 0 ? { name: 'Margin Interest', detail: `${fM(tl,cur)} × ${(intRate*100).toFixed(1)}% × ${holdDays}d`, amt: fM(interest, cur) } : null,
+        ],
+        fM(totalFees, cur),
+        { label: '淨損益(税後)', value: (netPL >= 0 ? '+' : '') + fM(netPL, cur) + ` (報酬率 ${(netPL / te * 100).toFixed(1)}%)`, positive: netPL >= 0 }
+      ) : ''}`;
 
     const steps = [30, 25, 20, 15, 10, 5, 0, -5, -10, -15, -20, -25, -30, -35, -40, -45, -50];
     let sRows = '';
@@ -1154,12 +1412,12 @@ function calcMargin() {
     totalFees = openFee + closeFee + openTax + borrowFee;
     const netPL = upl - totalFees;
     let maint, callP, forcedP;
-    if (tw) { maint = (dep + col) / cp; callP = (dep + col) / cr; forcedP = (dep + col) / fr; }
-    else { maint = (col + dep - cp) / cp; callP = (col + dep) / (1 + cr); forcedP = (col + dep) / (1 + fr); }
+    if (tw) { maint = cp > 0 ? (dep + col) / cp : 0; callP = cr > 0 ? (dep + col) / cr : 0; forcedP = fr > 0 ? (dep + col) / fr : 0; }
+    else { maint = cp > 0 ? (col + dep - cp) / cp : 0; callP = (col + dep) / (1 + cr); forcedP = (col + dep) / (1 + fr); }
     const ce = (dep + col - cp) * ts;
     const rl = tw ? riskLvl(maint * 100, 166, 140, cr * 100) : riskLvl(maint * 100, 50, 35, cr * 100);
     const mp = maint * 100, fillPct = tw ? Math.min(100, (mp - 100) / 100 * 100) : Math.min(100, mp);
-    const rC = callP - sp, rCP = rC / sp * 100;
+    const rC = callP - sp, rCP = sp > 0 ? rC / sp * 100 : 0;
     const statusMap = { safe: '安全', caution: '注意', danger: '追繳', critical: '斷頭' };
     const plH = upl >= 0 ? 'h-green' : 'h-red', plS = upl >= 0 ? '+' : '';
 
@@ -1167,19 +1425,31 @@ function calcMargin() {
       ${alertBox(rl === 'safe' ? 'safe' : rl === 'caution' ? 'warning' : 'danger', rl === 'safe' ? '做空部位安全' : rl === 'caution' ? '接近追繳邊緣' : '已觸發追繳/斷頭！')}
       ${riskBar(tw ? '擔保維持率' : 'Margin Ratio', fP(mp), statusMap[rl], rl, fillPct)}
       <div class="mg">
+        ${mgLabel('部位資訊')}
         ${mc(tw ? '融券保證金' : 'Margin Deposit', fM(dep * ts, cur), `${(smr * 100).toFixed(0)}% × 賣出價`)}
         ${mc(tw ? '融券擔保品' : 'Short Proceeds', fM(sp * ts, cur))}
         ${mc('總擔保', fM(tg2, cur), '保證金 + 擔保品')}
+        ${mgLabel('損益')}
         ${mc('做空損益(税前)', plS + fM(upl, cur), `權益 ${fM(ce, cur)}`, plH)}
-        ${totalFees > 0 ? mc('交易成本合計', fM(totalFees, cur), [
-          tw ? `手續費 ${fM(openFee + closeFee, cur)}` : `Comm ${fM(openFee + closeFee, cur)}`,
-          `${tw ? '證交稅' : 'SEC Fee'} ${fM(openTax, cur)}`,
-          borrowFee > 0 ? `${tw ? '借券費' : 'Borrow'}(${holdDays}天) ${fM(borrowFee, cur)}` : ''
-        ].filter(Boolean).join(' / '), 'h-yellow') : ''}
-        ${totalFees > 0 ? mc('淨損益(税後)', (netPL >= 0 ? '+' : '') + fM(netPL, cur), '', netPL >= 0 ? 'h-green' : 'h-red') : ''}
+        ${mgLabel('風險警示')}
         ${mc('追繳價(股價漲到)', fM(callP, cur, 2), `上漲 ${fP(rCP)}`, 'h-yellow')}
         ${mc('斷頭價', fM(forcedP, cur, 2), '', 'h-red')}
-      </div>`;
+      </div>
+      ${totalFees > 0 ? costTable(
+        tw ? [
+          { name: '融券賣出手續費', detail: `${fM(sp*ts,cur)} × 0.1425% × ${parseFloat($('#m-fee-disc')?.value||'0.5')*10}折`, amt: fM(openFee, cur) },
+          { name: '回補買進手續費', detail: `${fM(cp*ts,cur)} × 0.1425% × ${parseFloat($('#m-fee-disc')?.value||'0.5')*10}折`, amt: fM(closeFee, cur) },
+          { name: '證交稅(賣出)', detail: `${fM(sp*ts,cur)} × ${(parseFloat($('#m-tax-rate')?.value||'0.003')*100).toFixed(2)}%`, amt: fM(openTax, cur) },
+          borrowFee > 0 ? { name: '借券費', detail: `${fM(sp*ts,cur)} × ${(intRate*100).toFixed(2)}% × ${holdDays}天`, amt: fM(borrowFee, cur) } : null,
+        ] : [
+          { name: 'Commission (Sell)', amt: fM(openFee, cur) },
+          { name: 'Commission (Buy-to-cover)', amt: fM(closeFee, cur) },
+          { name: 'SEC Fee', detail: `${fM(sp*ts,cur)} × 0.00278%`, amt: fM(openTax, cur) },
+          borrowFee > 0 ? { name: 'Borrow Fee', detail: `${fM(sp*ts,cur)} × ${(intRate*100).toFixed(1)}% × ${holdDays}d`, amt: fM(borrowFee, cur) } : null,
+        ],
+        fM(totalFees, cur),
+        { label: '淨損益(税後)', value: (netPL >= 0 ? '+' : '') + fM(netPL, cur), positive: netPL >= 0 }
+      ) : ''}`;
 
     const steps = [-30, -25, -20, -15, -10, -5, 0, 5, 10, 15, 20, 25, 30, 35, 40, 50, 60];
     let sRows = '';
@@ -1340,6 +1610,7 @@ function renderFuturesForm() {
   fillFromTicker('f-current');
 
   wrapNumberInputs($('#futures-inputs'));
+  calcFutures();
 }
 
 window.fetchFuturesPrice = async function(targetId) {
@@ -1359,6 +1630,8 @@ window.fetchFuturesPrice = async function(targetId) {
     el.value = q.price.toFixed(2);
     el.placeholder = mk === 'tw' ? '即時報價' : 'Live price';
     el.dispatchEvent(new Event('input', { bubbles: true }));
+    const provName = mk === 'tw' ? PriceService.PROVIDER_INFO[CFG.twSource]?.name : PriceService.PROVIDER_INFO[CFG.usSource]?.name;
+    stampTime(targetId, provName || 'API');
   } catch {
     el.placeholder = '查詢失敗';
     setTimeout(() => { el.placeholder = '即時報價'; }, 2000);
@@ -1368,15 +1641,23 @@ window.fetchFuturesPrice = async function(targetId) {
 window.fillFromTicker = function(targetId) {
   const mk = S.futures.market;
   const contract = $('#f-contract')?.value || '';
-  let idxId = 'idx-taiex';
-  if (mk === 'us') {
-    if (['ES', 'MES'].includes(contract)) idxId = 'idx-sp500';
-    else if (['NQ', 'MNQ'].includes(contract)) idxId = 'idx-nasdaq';
-    else if (['YM', 'MYM'].includes(contract)) idxId = 'idx-dow';
-    else idxId = 'idx-sp500';
+  let idxId = 'idx-taiex', idxName = '加權指數';
+  if (mk === 'tw') {
+    // 台灣期貨優先用台指期報價，沒有則用加權指數
+    const txfVal = gV('idx-txf');
+    if (txfVal && ['TX', 'MTX', 'MXF'].includes(contract)) { idxId = 'idx-txf'; idxName = '台指期'; }
+  } else {
+    if (['ES', 'MES'].includes(contract)) { idxId = 'idx-sp500'; idxName = 'S&P 500'; }
+    else if (['NQ', 'MNQ'].includes(contract)) { idxId = 'idx-nasdaq'; idxName = 'Nasdaq'; }
+    else if (['YM', 'MYM'].includes(contract)) { idxId = 'idx-dow'; idxName = '道瓊'; }
+    else { idxId = 'idx-sp500'; idxName = 'S&P 500'; }
   }
   const v = gV(idxId);
-  if (v) { document.getElementById(targetId).value = v; document.getElementById(targetId).dispatchEvent(new Event('input', { bubbles: true })); }
+  if (v) {
+    document.getElementById(targetId).value = v;
+    document.getElementById(targetId).dispatchEvent(new Event('input', { bubbles: true }));
+    stampTime(targetId, idxName);
+  }
 };
 
 // ================================================================
@@ -1444,19 +1725,33 @@ function calcFutures() {
       rl === 'safe' ? '風險指標充足' : rl === 'caution' ? '風險指標偏低，接近追繳' : rl === 'danger' ? '權益數 < 維持保證金！需補繳至原始保證金水位' : '風險指標 ≤ 25%，可強制砍倉！')}
     ${riskBar('風險指標', fP(ri), statusMap[rl], rl, fillPct)}
     <div class="mg">
+      ${mgLabel('合約資訊')}
       ${mc('合約', cn, `${long ? '做多' : '做空'} ${qty}口 @ ${fmt(entry)} ${u}`)}
-      ${mc('初始權益數', fM(initEq, cur), excessMargin > 0 ? `超額 ${fM(excessMargin, cur)}` : excessMargin < 0 ? `不足 ${fM(-excessMargin, cur)}` : '= 原始保證金', excessMargin > 0 ? 'h-accent' : excessMargin < 0 ? 'h-red' : '')}
       ${mc('所需原始保證金', fM(tIM, cur), `每口 ${fM(im, cur)}`)}
       ${mc('所需維持保證金', fM(tMM, cur), `每口 ${fM(mm, cur)}`)}
+      ${mc('初始權益數', fM(initEq, cur), excessMargin > 0 ? `超額 ${fM(excessMargin, cur)}` : excessMargin < 0 ? `不足 ${fM(-excessMargin, cur)}` : '= 原始保證金', excessMargin > 0 ? 'h-accent' : excessMargin < 0 ? 'h-red' : '')}
+      ${mc('每點損益', fM(ppm, cur), `${mul} × ${qty}口`)}
+      ${mgLabel('損益')}
       ${mc('未實現損益(税前)', plS + fM(upl, cur), `${pd >= 0 ? '+' : ''}${fmt(pd, 2)} ${u}`, plH)}
-      ${futFees > 0 ? mc('交易成本', fM(futFees, cur), `手續費 ${fM(commTotal, cur)} / ${tw ? '期交稅' : 'Tax'} ${fM(taxTotal, cur)}`, 'h-yellow') : ''}
-      ${futFees > 0 ? mc('淨損益(税後)', (upl - futFees >= 0 ? '+' : '') + fM(upl - futFees, cur), '', (upl - futFees) >= 0 ? 'h-green' : 'h-red') : ''}
       ${mc('目前權益數', fM(eq, cur), '初始權益 + 損益', eq <= tMM ? 'h-red' : 'h-accent')}
+      ${mc('可承受虧損(至追繳)', fM(maxLossToCall, cur), `${fmt(ptToCall, 2)} ${u}`)}
+      ${mgLabel('風險警示')}
       ${mc('追繳點位', fmt(callLvl, 2) + ' ' + u, dC > 0 ? `距目前 ${fmt(dC, 2)} ${u} (${fP(dC / curr * 100)})` : '已追繳!', 'h-yellow')}
       ${mc('砍倉點位(RI≤25%)', fmt(forcedLvl, 2) + ' ' + u, dF > 0 ? `距目前 ${fmt(dF, 2)} ${u} (${fP(dF / curr * 100)})` : '已砍倉!', 'h-red')}
-      ${mc('每點損益', fM(ppm, cur), `${mul} × ${qty}口`)}
-      ${mc('可承受虧損(至追繳)', fM(maxLossToCall, cur), `${fmt(ptToCall, 2)} ${u}`)}
-    </div>`;
+    </div>
+    ${futFees > 0 ? costTable(
+      tw ? [
+        { name: '手續費(進場)', detail: `${fM(fComm,cur)}/口 × ${qty}口`, amt: fM(fComm * qty, cur) },
+        { name: '手續費(出場)', detail: `${fM(fComm,cur)}/口 × ${qty}口`, amt: fM(fComm * qty, cur) },
+        { name: '期交稅(進場)', detail: `${fmt(entry)} × ${fmt(mul)} × ${qty}口 × ${fTaxRate}`, amt: fM(entryTax, cur) },
+        { name: '期交稅(出場)', detail: `${fmt(curr)} × ${fmt(mul)} × ${qty}口 × ${fTaxRate}`, amt: fM(exitTax, cur) },
+      ] : [
+        { name: 'Commission (Entry)', detail: `${fM(fComm,cur)} × ${qty}`, amt: fM(fComm * qty, cur) },
+        { name: 'Commission (Exit)', detail: `${fM(fComm,cur)} × ${qty}`, amt: fM(fComm * qty, cur) },
+      ],
+      fM(futFees, cur),
+      { label: '淨損益(税後)', value: (upl - futFees >= 0 ? '+' : '') + fM(upl - futFees, cur), positive: (upl - futFees) >= 0 }
+    ) : ''}`;
 
   // Stress test: now using initEq instead of tIM
   const steps = [10, 8, 6, 5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5, -6, -8, -10, -12, -15, -20];
@@ -1561,6 +1856,7 @@ function renderOptionsForm() {
   $('#options-results').innerHTML = PLACEHOLDER;
 
   wrapNumberInputs($('#options-inputs'));
+  calcOptions();
 }
 
 window.fetchOptPrice = async function() {
@@ -1573,6 +1869,9 @@ window.fetchOptPrice = async function() {
     el.value = q.price.toFixed(2);
     el.placeholder = S.options.market === 'tw' ? '20000' : '500';
     el.dispatchEvent(new Event('input', { bubbles: true }));
+    const mk = S.options.market;
+    const provName = mk === 'tw' ? PriceService.PROVIDER_INFO[CFG.twSource]?.name : PriceService.PROVIDER_INFO[CFG.usSource]?.name;
+    stampTime('o-ul', provName || 'API');
   } catch {
     el.placeholder = '查詢失敗';
     setTimeout(() => { el.placeholder = S.options.market === 'tw' ? '20000' : '500'; }, 2000);
@@ -1580,9 +1879,14 @@ window.fetchOptPrice = async function() {
 };
 
 window.fillOptFromTicker = function() {
-  const id = S.options.market === 'tw' ? 'idx-taiex' : 'idx-sp500';
+  const tw = S.options.market === 'tw';
+  const id = tw ? 'idx-taiex' : 'idx-sp500';
   const v = gV(id);
-  if (v) { document.getElementById('o-ul').value = v; document.getElementById('o-ul').dispatchEvent(new Event('input', { bubbles: true })); }
+  if (v) {
+    document.getElementById('o-ul').value = v;
+    document.getElementById('o-ul').dispatchEvent(new Event('input', { bubbles: true }));
+    stampTime('o-ul', tw ? '加權指數' : 'S&P 500');
+  }
 };
 
 // ================================================================
@@ -1623,15 +1927,28 @@ function calcOptions() {
     const overview = `
       ${alertBox('safe', '買方風險有限，最大虧損 = 權利金。不會追繳或斷頭。')}
       <div class="mg">
+        ${mgLabel('合約資訊')}
         ${mc(`${isCall ? 'Call' : 'Put'} 買方`, money, `履約價 ${fmt(strike)} | ${qty}口`, 'h-accent')}
-        ${mc('最大虧損 = 權利金+費用', fM(totalPrem + oFees, cur), `權利金 ${fM(totalPrem, cur)} + 費用 ${fM(oFees, cur)}`, 'h-red')}
-        ${oFees > 0 ? mc('交易成本', fM(oFees, cur), `手續費 ${fM(oCommTotal, cur)} / ${tw ? '交易稅' : 'Tax'} ${fM(oOpenTax + oCloseTax, cur)}`, 'h-yellow') : ''}
-        ${mc('損益平衡', fmt(be, 2), isCall ? '履約價 + 權利金' : '履約價 - 權利金')}
         ${mc('內含價值 / 時間價值', fmt(iv, 2) + ' / ' + fmt(tv, 2))}
+        ${mc('損益平衡', fmt(be, 2), isCall ? '履約價 + 權利金' : '履約價 - 權利金')}
+        ${mgLabel('損益')}
+        ${mc('最大虧損 = 權利金+費用', fM(totalPrem + oFees, cur), `權利金 ${fM(totalPrem, cur)} + 費用 ${fM(oFees, cur)}`, 'h-red')}
         ${mc('最大獲利', isCall ? '無上限' : fM((strike - prem) * mul * qty, cur))}
         ${expPL !== null ? mc('到期損益(税前)', (expPL >= 0 ? '+' : '') + fM(expPL, cur), `結算價 ${fmt(expP)} | 報酬率 ${(expPL / totalPrem * 100).toFixed(1)}%`, expPL >= 0 ? 'h-green' : 'h-red') : ''}
-        ${expPL !== null && oFees > 0 ? mc('到期淨損益(税後)', ((expPL - oFees) >= 0 ? '+' : '') + fM(expPL - oFees, cur), `扣除費用 ${fM(oFees, cur)}`, (expPL - oFees) >= 0 ? 'h-green' : 'h-red') : ''}
-      </div>`;
+      </div>
+      ${oFees > 0 ? costTable(
+        tw ? [
+          { name: '手續費(開倉)', detail: `${fM(oComm,cur)}/口 × ${qty}口`, amt: fM(oComm * qty, cur) },
+          { name: '手續費(平倉)', detail: `${fM(oComm,cur)}/口 × ${qty}口`, amt: fM(oComm * qty, cur) },
+          { name: '交易稅(開倉)', detail: `${fM(totalPrem,cur)} × ${(oTaxRate*100).toFixed(2)}%`, amt: fM(oOpenTax, cur) },
+          { name: '交易稅(平倉)', detail: `${fM(totalPrem,cur)} × ${(oTaxRate*100).toFixed(2)}%`, amt: fM(oCloseTax, cur) },
+        ] : [
+          { name: 'Commission (Open)', detail: `${fM(oComm,cur)} × ${qty}`, amt: fM(oComm * qty, cur) },
+          { name: 'Commission (Close)', detail: `${fM(oComm,cur)} × ${qty}`, amt: fM(oComm * qty, cur) },
+        ],
+        fM(oFees, cur),
+        expPL !== null ? { label: '到期淨損益(税後)', value: ((expPL - oFees) >= 0 ? '+' : '') + fM(expPL - oFees, cur), positive: (expPL - oFees) >= 0 } : null
+      ) : ''}`;
     const stress = buildOptionsStress(isCall, buyer, prem, strike, mul, qty, ul, cur);
     const formula = `<div class="fc">
       <div class="fb"><h4>1. 權利金成本</h4>
@@ -1669,17 +1986,31 @@ function calcOptions() {
     const overview = `
       ${alertBox('danger', `賣方風險${isCall ? '無上限' : '極大'}！需繳交保證金，可能被追繳。`)}
       <div class="mg">
+        ${mgLabel('合約資訊')}
         ${mc(`${isCall ? 'Call' : 'Put'} 賣方`, money, `履約價 ${fmt(strike)} | ${qty}口`, 'h-red')}
-        ${mc('所需保證金', fM(totalMargin, cur), `每口 ${fM(mpc, cur)}`, 'h-yellow')}
-        ${mc('最大獲利(税前)', fM(totalPrem, cur), '', 'h-green')}
-        ${oFees > 0 ? mc('交易成本', fM(oFees, cur), `手續費 ${fM(oCommTotal, cur)} / ${tw ? '交易稅' : 'Tax'} ${fM(oOpenTax + oCloseTax, cur)}`, 'h-yellow') : ''}
-        ${oFees > 0 ? mc('最大淨獲利(税後)', fM(totalPrem - oFees, cur), '', 'h-green') : ''}
-        ${mc('最大虧損', isCall ? '無上限' : fM((strike - prem) * mul * qty, cur), '', 'h-red')}
-        ${mc('損益平衡', fmt(be, 2))}
         ${mc('價外值', fmt(oom, 2), `A=${fM(A, cur)} B=${fM(B, cur)}`)}
+        ${mc('損益平衡', fmt(be, 2))}
+        ${mgLabel('保證金')}
+        ${mc('所需保證金', fM(totalMargin, cur), `每口 ${fM(mpc, cur)}`, 'h-yellow')}
+        ${mgLabel('損益')}
+        ${mc('最大獲利(税前)', fM(totalPrem, cur), '', 'h-green')}
+        ${oFees > 0 ? mc('最大淨獲利(税後)', fM(totalPrem - oFees, cur), `扣除費用 ${fM(oFees, cur)}`, 'h-green') : ''}
+        ${mc('最大虧損', isCall ? '無上限' : fM((strike - prem) * mul * qty, cur), '', 'h-red')}
         ${expPL !== null ? mc('到期損益(税前)', (expPL >= 0 ? '+' : '') + fM(expPL, cur), `結算價 ${fmt(expP)}`, expPL >= 0 ? 'h-green' : 'h-red') : ''}
-        ${expPL !== null && oFees > 0 ? mc('到期淨損益(税後)', ((expPL - oFees) >= 0 ? '+' : '') + fM(expPL - oFees, cur), '', (expPL - oFees) >= 0 ? 'h-green' : 'h-red') : ''}
-      </div>`;
+      </div>
+      ${oFees > 0 ? costTable(
+        tw ? [
+          { name: '手續費(開倉)', detail: `${fM(oComm,cur)}/口 × ${qty}口`, amt: fM(oComm * qty, cur) },
+          { name: '手續費(平倉)', detail: `${fM(oComm,cur)}/口 × ${qty}口`, amt: fM(oComm * qty, cur) },
+          { name: '交易稅(開倉)', detail: `${fM(totalPrem,cur)} × ${(oTaxRate*100).toFixed(2)}%`, amt: fM(oOpenTax, cur) },
+          { name: '交易稅(平倉)', detail: `${fM(totalPrem,cur)} × ${(oTaxRate*100).toFixed(2)}%`, amt: fM(oCloseTax, cur) },
+        ] : [
+          { name: 'Commission (Open)', detail: `${fM(oComm,cur)} × ${qty}`, amt: fM(oComm * qty, cur) },
+          { name: 'Commission (Close)', detail: `${fM(oComm,cur)} × ${qty}`, amt: fM(oComm * qty, cur) },
+        ],
+        fM(oFees, cur),
+        expPL !== null ? { label: '到期淨損益(税後)', value: ((expPL - oFees) >= 0 ? '+' : '') + fM(expPL - oFees, cur), positive: (expPL - oFees) >= 0 } : null
+      ) : ''}`;
     const stress = buildOptionsStress(isCall, buyer, prem, strike, mul, qty, ul, cur);
     const maxLoss = isCall ? '無上限' : fM((strike - prem) * mul * qty, cur);
     const formula = `<div class="fc">
